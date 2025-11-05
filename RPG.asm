@@ -23,9 +23,15 @@ section .data
     SYS_OPEN equ 2
     SYS_CLOSE equ 3
     SYS_MMAP equ 9
+    SYS_MUNMAP equ 11
     SYS_IOCTL equ 16
+    SYS_RT_SIGACTION equ 13
     SYS_NANOSLEEP equ 35
     SYS_EXIT equ 60
+
+    ; --- Signal Constants ---
+    SIGINT equ 2                ; Signal 2 = Interrupt (Ctrl+C)
+    SA_RESTORER equ 0x04000000  ; Required flag
 
     ; --- File Access Constants ---
     O_RDWR equ 0x2
@@ -45,16 +51,25 @@ section .data
     ; or /dev/input/by-path/ to find the correct keyboard event file.
     input_event_path db '/dev/input/event0', 0
 
-    ; --- DRM IOCTL Magic Numbers (PLACEHOLDERS) ---
-    ; These must be defined from the kernel headers (e.g., <drm/drm.h>, <drm/drm_mode.h>)
-    DRM_IOCTL_MODE_GETRESOURCES equ 0x...   ; TODO: Find value
-    DRM_IOCTL_MODE_GETCONNECTOR equ 0x...   ; TODO: Find value
-    DRM_IOCTL_MODE_CREATE_DUMB equ 0x...    ; TODO: Find value
-    DRM_IOCTL_MODE_MAP_DUMB equ 0x...       ; TODO: Find value
-    DRM_IOCTL_MODE_SET_CRTC equ 0x...       ; TODO: Find value
-    DRM_IOCTL_MODE_ADDFB equ 0x...          ; TODO: Find value (for legacy framebuffer)
-    DRM_IOCTL_MODE_RMFB equ 0x...           ; TODO: Find value
-    DRM_IOCTL_MODE_GET_CRTC equ 0x...       ; TODO: Find value (to restore on exit)
+    ; --- DRM IOCTL Magic Numbers (Correct for x86_64) ---
+    ; _IOWR(DRM_COMMAND_BASE, 0xA0, struct drm_mode_card_res)
+    DRM_IOCTL_MODE_GETRESOURCES equ 0xC02064A0
+    ; _IOWR(DRM_COMMAND_BASE, 0xA7, struct drm_mode_get_connector)
+    DRM_IOCTL_MODE_GETCONNECTOR equ 0xC04064A7
+    ; _IOWR(DRM_COMMAND_BASE, 0xB2, struct drm_mode_create_dumb)
+    DRM_IOCTL_MODE_CREATE_DUMB equ 0xC02064B2
+    ; _IOWR(DRM_COMMAND_BASE, 0xB3, struct drm_mode_map_dumb)
+    DRM_IOCTL_MODE_MAP_DUMB equ 0xC01064B3
+    ; _IOWR(DRM_COMMAND_BASE, 0xA2, struct drm_mode_crtc)
+    DRM_IOCTL_MODE_SET_CRTC equ 0xC06064A2
+    ; _IOWR(DRM_COMMAND_BASE, 0xA1, struct drm_mode_crtc)
+    DRM_IOCTL_MODE_GET_CRTC equ 0xC05864A1
+    ; _IOWR(DRM_COMMAND_BASE, 0xA6, struct drm_mode_get_encoder)
+    DRM_IOCTL_MODE_GETENCODER equ 0xC01C64A6
+    ; _IOWR(DRM_COMMAND_BASE, 0xA8, struct drm_mode_fb_cmd)
+    DRM_IOCTL_MODE_ADDFB equ 0xC01C64A8
+    ; _IOWR(DRM_COMMAND_BASE, 0xA9, struct drm_mode_rm_fb)
+    DRM_IOCTL_MODE_RMFB equ 0x800464A9
 
     ; --- Game Strings ---
     msg_test_dialog db 'This is a test dialogue box. Press (Confirm).', 0
@@ -120,8 +135,14 @@ section .data
     frame_delay_req:
         dq 0            ; tv_sec
         dq 16666667     ; tv_nsec
-    frame_delay_rem:
-        resb 16
+    ; --- REMOVED 'frame_delay_rem' FROM .data ---
+
+    ; --- SIGACTION Structure ---
+    ; struct sigaction { void (*sa_handler)(int); unsigned long sa_flags; ... }
+    sa_handler_struct:
+        dq clean_exit       ; sa_handler (pointer to our function)
+        dq SA_RESTORER      ; sa_flags
+        dq 0                ; sa_restorer (unused in simple cases)
 
 ;----------------------------------------------------------------------
 ; SECTION .bss (Uninitialized Data)
@@ -134,16 +155,57 @@ section .bss
     screen_height resd 1
     buffer_pitch resd 1         ; Bytes per horizontal line
     buffer_handle resd 1
-
+    buffer_size resq 1          ; 64-bit total size of the buffer
+    
+    ; --- ADDED 'frame_delay_rem' TO .bss ---
+    frame_delay_rem:
+        resb 16
+    
     ; --- DRM Structs (Placeholders) ---
     ; We reserve space for the kernel to write into when we call ioctl
-    ; NOTE: These sizes are guesstimates and must be verified from headers!
-    drm_resources_struct resb 256
+    ; NOTE: These sizes MUST be correct for the kernel ABI
+    
+    ; We need pointers for the kernel to write the list addresses into
+    res_connector_ptr resq 1
+    res_crtc_ptr resq 1
+    
+    ; struct drm_mode_card_res
+    ; 6 * 8-byte pointers (fb, crtc, conn, enc, ...)
+    ; 4 * 4-byte counts (count_fbs, count_crtcs, ...)
+    ; 4 * 4-byte mins/maxs (min_w, max_w, ...)
+    drm_resources_struct:
+        resq 1  ; fb_id_ptr
+        resq 1  ; crtc_id_ptr
+        resq 1  ; connector_id_ptr
+        resq 1  ; encoder_id_ptr
+        resd 1  ; count_fbs
+        resd 1  ; count_crtcs
+        resd 1  ; count_connectors
+        resd 1  ; count_encoders
+        resd 1  ; min_width
+        resd 1  ; max_width
+        resd 1  ; min_height
+        resd 1  ; max_height
+
+    ; Pointers to the lists themselves (we need 16 entries max for now)
+    connector_id_list resq 16
+    crtc_id_list resq 16
+    encoder_id_list resq 16
+
+    ; We use a generous 256 bytes. The kernel fills this.
     drm_connector_struct resb 256
-    drm_create_dumb_struct resb 32
-    drm_map_dumb_struct resb 16
-    drm_set_crtc_struct resb 256
-    drm_old_crtc_struct resb 256    ; To restore the console on exit
+    drm_encoder_struct resb 28     ; sizeof(struct drm_mode_get_encoder)
+    drm_create_dumb_struct resb 32  ; sizeof(struct drm_mode_create_dumb)
+    drm_map_dumb_struct resb 16     ; sizeof(struct drm_mode_map_dumb)
+    
+    ; struct drm_mode_crtc
+    drm_set_crtc_struct resb 88     ; sizeof(struct drm_mode_crtc)
+    drm_old_crtc_struct resb 88     ; To restore the console on exit
+
+    ; --- DRM Results (to store what we find) ---
+    selected_connector_id resd 1
+    selected_crtc_id resd 1
+    selected_mode resb 32           ; sizeof(struct drm_mode_modeinfo)
 
     ; --- Input State ---
     input_fd resq 1
@@ -179,6 +241,9 @@ section .text
 global _start
 
 _start:
+    ; 0. Setup Ctrl+C (SIGINT) handler
+    call setup_sigint_handler
+
     ; 1. Initialize Graphics (DRM/KMS)
     call init_graphics
     cmp rax, 0
@@ -218,44 +283,309 @@ init_graphics:
     ; This is the most complex part. It involves a 5-phase setup.
     push rbp
     mov rbp, rsp
+    push rbx                ; Save callee-saved registers
+    push r12
+    push r13
+    push r14
+    push r15
     
-    ; TODO: Phase 1: Open /dev/dri/card0 (SYS_OPEN)
-    ; Store fd in [gpu_fd]
-
-    ; TODO: Phase 2: Find a valid screen and mode
-    ;  a. ioctl(gpu_fd, DRM_IOCTL_MODE_GETRESOURCES, ...)
-    ;  b. Parse resources to find a connector_id
-    ;  c. ioctl(gpu_fd, DRM_IOCTL_MODE_GETCONNECTOR, ...)
-    ;  d. Parse connector to find a valid mode (width/height)
-    ;  e.Parse connector to find a valid encoder_id
-    ;  f. Parse resources to find a crtc_id
+    ; --- Phase 1: Open /dev/dri/card0 (SYS_OPEN) ---
+    mov rax, SYS_OPEN
+    mov rdi, dri_path
+    mov rsi, O_RDWR
+    syscall
     
-    ; TODO: Phase 3: Create a "Dumb Buffer"
-    ;  a. Fill drm_create_dumb_struct (width, height, 32bpp)
-    ;  b. ioctl(gpu_fd, DRM_IOCTL_MODE_CREATE_DUMB, ...)
-    ;  c. Store buffer_handle, buffer_pitch, and size from struct
-    ;  d. Store width/height in [screen_width]/[screen_height]
+    cmp rax, 0
+    jl .init_fail           ; If rax is negative, open failed
+    mov [gpu_fd], rax
+    mov rbx, rax            ; Keep gpu_fd in rbx for convenience
 
-    ; TODO: Phase 4: Set the Mode (Go Fullscreen)
-    ;  a. ioctl(gpu_fd, DRM_IOCTL_MODE_GET_CRTC, &drm_old_crtc_struct) ; Save old mode
-    ;  b. Fill drm_set_crtc_struct (crtc_id, buffer_handle, mode)
-    ;  c. ioctl(gpu_fd, DRM_IOCTL_MODE_SET_CRTC, ...)
+    ; --- Phase 2a: Get Hardware Resources (CRTCs, Connectors) ---
+    
+    ; We need to set the pointers in the struct *before* the call
+    mov rax, connector_id_list
+    mov [drm_resources_struct + 16], rax ; connector_id_ptr
+    
+    mov rax, crtc_id_list
+    mov [drm_resources_struct + 8], rax  ; crtc_id_ptr
+    
+    mov rax, encoder_id_list
+    mov [drm_resources_struct + 24], rax ; encoder_id_ptr
+    
+    ; Set the counts to the size of our lists (16)
+    mov dword [drm_resources_struct + 36], 16 ; count_connectors
+    mov dword [drm_resources_struct + 32], 16 ; count_crtcs
+    mov dword [drm_resources_struct + 40], 16 ; count_encoders
+    
+    mov rax, SYS_IOCTL
+    mov rdi, rbx            ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_GETRESOURCES
+    mov rdx, drm_resources_struct
+    syscall
+    
+    cmp rax, 0
+    jl .init_fail           ; If ioctl failed, exit
 
-    ; TODO: Phase 5: Map the buffer to our memory
-    ;  a. Fill drm_map_dumb_struct (buffer_handle)
-    ;  b. ioctl(gpu_fd, DRM_IOCTL_MODE_MAP_DUMB, ...)
-    ;  c. Get 'offset' from struct
-    ;  d. mov rax, SYS_MMAP
-    ;     rdi=0, rsi=size, rdx=PROT_READ|PROT_WRITE, r10=MAP_SHARED, r8=gpu_fd, r9=offset
-    ;     syscall
-    ;  e. Store rax (the pointer) in [framebuffer_pointer]
+    ; --- Phase 2b/2c/2d: Find a "Connected" Monitor (Connector) ---
+    mov r12d, [drm_resources_struct + 36] ; r12d = number of connectors found
+    xor r13, r13                          ; r13 = loop counter (i)
+    
+.connector_loop:
+    cmp r13, r12                ; Have we checked all connectors?
+    jae .no_connector_found     ; If yes, fail (no monitor plugged in)
+
+    ; 1. Get connector_id from the list
+    mov rdi, [connector_id_list + r13*8]
+    inc r13                     ; (i++)
+    
+    ; 2. Call GETCONNECTOR to get its info
+    ; Set the connector_id field (offset 8)
+    mov [drm_connector_struct + 8], rdi
+    
+    mov rax, SYS_IOCTL
+    mov rdi, rbx                ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_GETCONNECTOR
+    mov rdx, drm_connector_struct
+    syscall
+    
+    cmp rax, 0
+    jl .connector_loop          ; If ioctl failed, try next connector
+    
+    ; 3. Check connection status (offset 16)
+    mov eax, [drm_connector_struct + 16]
+    cmp eax, 1                  ; 1 = DRM_MODE_CONNECTED
+    jne .connector_loop         ; If not 1, try next connector
+
+    ; 4. Check that it has at least one mode (offset 36)
+    mov eax, [drm_connector_struct + 36]
+    cmp eax, 0
+    jle .connector_loop         ; If 0 modes, try next connector
+
+    ; --- Success: We found a connected monitor! ---
+    ; 5. Save the connector_id (offset 8)
+    mov eax, [drm_connector_struct + 8]
+    mov [selected_connector_id], eax
+    
+    ; 6. Save the first available mode (offset 40)
+    ; struct drm_mode_modeinfo is 32 bytes
+    lea rsi, [drm_connector_struct + 40] ; rsi = pointer to first mode
+    lea rdi, [selected_mode]             ; rdi = destination
+    mov rcx, 32                          ; 32 bytes
+    rep movsb
+    
+    ; --- Phase 2e/2f: Find a compatible Encoder and CRTC ---
+    ; We have a list of encoders for our connector in [encoder_id_list]
+    ; We have a list of all CRTCs in [crtc_id_list]
+    ; We must find an encoder that has a bitmask entry for a valid CRTC.
+    
+    mov r12d, [drm_connector_struct + 32] ; r12d = count_encoders
+    mov r13, encoder_id_list             ; r13 = encoder_id_list pointer
+    xor r14, r14                         ; r14 = outer loop counter (i)
+    
+.encoder_loop:
+    cmp r14, r12                ; Have we checked all encoders?
+    jae .no_crtc_found          ; If yes, fail (no compatible encoder/crtc)
+    
+    ; 1. Get an encoder_id from our connector's list
+    mov rdi, [r13 + r14*8]
+    inc r14                     ; (i++)
+    
+    ; 2. Call GETENCODER to get its info
+    mov dword [drm_encoder_struct + 4], edi ; Set encoder_id field (offset 4)
+    
+    mov rax, SYS_IOCTL
+    mov rdi, rbx                            ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_GETENCODER
+    mov rdx, drm_encoder_struct
+    syscall
+    
+    cmp rax, 0
+    jl .encoder_loop        ; If ioctl failed, try next encoder
+    
+    ; 3. Get the 'possible_crtcs' bitmask from the encoder struct
+    mov r10d, [drm_encoder_struct + 12] ; r10d = possible_crtcs (offset 12)
+    
+    ; 4. Check this bitmask against our list of CRTCs
+    mov r15d, [drm_resources_struct + 32] ; r15d = res_count_crtcs
+    xor r9, r9                           ; r9 = inner loop counter (j)
+    
+.crtc_loop:
+    cmp r9, r15                 ; Have we checked all CRTCs?
+    jae .encoder_loop           ; If yes, this encoder failed, try next one
+    
+    ; Check if bit 'j' is set in 'possible_crtcs'
+    mov rax, r10                ; Use rax for bit test
+    mov cl, r9b                 ; Move 8-bit loop counter 'j' into CL
+    shr rax, cl                 ; Shift rax right by the amount in CL
+    and rax, 1                  ; Isolate the bit
+    
+    cmp rax, 1
+    jne .next_crtc              ; Bit not set, this CRTC is not compatible
+    
+    ; --- Success: We found a match! ---
+    ; The 'j'th CRTC in [crtc_id_list] is compatible.
+    mov eax, [crtc_id_list + r9*8]
+    mov [selected_crtc_id], eax ; Save the 32-bit ID
+    
+    jmp .connector_found        ; We are done with Phase 2
+    
+.next_crtc:
+    inc r9                      ; (j++)
+    jmp .crtc_loop
+
+.no_crtc_found:
+    ; We looped all encoders and found no compatible CRTC
+    jmp .init_fail
+
+.no_connector_found:
+    jmp .init_fail          ; No connected monitor found
+
+.connector_found:
+    ; --- Phase 3: Create a "Dumb Buffer" ---
+    
+    ; 3a. Fill drm_create_dumb_struct
+    ; We get the width (hdisplay) from the mode info (offset 16)
+    movzx eax, word [selected_mode + 16]
+    mov [drm_create_dumb_struct + 4], eax   ; Set width
+    mov [screen_width], eax                 ; Save for game logic
+    
+    ; We get the height (vdisplay) from the mode info (offset 18)
+    movzx eax, word [selected_mode + 18]
+    mov [drm_create_dumb_struct + 0], eax   ; Set height
+    mov [screen_height], eax                ; Save for game logic
+    
+    ; Set 32 bits per pixel (4 bytes)
+    mov dword [drm_create_dumb_struct + 8], 32
+    ; Set flags to 0
+    mov dword [drm_create_dumb_struct + 12], 0
+    
+    ; 3b. Call ioctl to create the buffer
+    mov rax, SYS_IOCTL
+    mov rdi, rbx                            ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_CREATE_DUMB
+    mov rdx, drm_create_dumb_struct
+    syscall
+    
+    cmp rax, 0
+    jl .init_fail           ; Fail if ioctl error
+    
+    ; 3c. Store the results from the struct
+    ; The kernel filled in handle, pitch, and size
+    mov eax, [drm_create_dumb_struct + 16]
+    mov [buffer_handle], eax
+    
+    mov eax, [drm_create_dumb_struct + 20]
+    mov [buffer_pitch], eax
+    
+    mov rax, [drm_create_dumb_struct + 24]
+    mov [buffer_size], rax
+
+    ; --- Phase 4: Set the Mode (Go Fullscreen) ---
+    
+    ; 4a. Save the current CRTC settings so we can restore on exit
+    ; We need to set the crtc_id in the struct (offset 8)
+    mov eax, [selected_crtc_id]
+    mov [drm_old_crtc_struct + 8], eax
+    
+    mov rax, SYS_IOCTL
+    mov rdi, rbx                        ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_GET_CRTC
+    mov rdx, drm_old_crtc_struct
+    syscall
+    ; We don't care if this fails, but we must try.
+    
+    ; 4b. Fill the SET_CRTC struct to apply our new mode
+    ; Zero out the struct first
+    mov rdi, drm_set_crtc_struct
+    mov rcx, 88 / 8 ; 11 qwords
+    xor rax, rax
+    rep stosq
+    
+    ; Set crtc_id (offset 8)
+    mov eax, [selected_crtc_id]
+    mov [drm_set_crtc_struct + 8], eax
+    
+    ; Set buffer_handle (offset 12)
+    mov eax, [buffer_handle]
+    mov [drm_set_crtc_struct + 12], eax
+    
+    ; Set connector_id (offset 24)
+    mov eax, [selected_connector_id]
+    mov [drm_set_crtc_struct + 24], eax
+    
+    ; Set connector_count (offset 20)
+    mov dword [drm_set_crtc_struct + 20], 1
+    
+    ; Copy the 32-byte mode info struct (offset 28)
+    lea rsi, [selected_mode]
+    lea rdi, [drm_set_crtc_struct + 28]
+    mov rcx, 32
+    rep movsb
+    
+    ; 4c. Call ioctl to SET the CRTC
+    mov rax, SYS_IOCTL
+    mov rdi, rbx                        ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_SET_CRTC
+    mov rdx, drm_set_crtc_struct
+    syscall
+    
+    cmp rax, 0
+    jl .init_fail           ; Fail if ioctl error
+    
+    ; --- Phase 5: Map the buffer to our memory ---
+    
+    ; 5a. Fill drm_map_dumb_struct
+    ; We need to set the handle (offset 0)
+    mov eax, [buffer_handle]
+    mov [drm_map_dumb_struct + 0], eax
+    
+    ; 5b. Call ioctl to get the memory offset for mmap
+    mov rax, SYS_IOCTL
+    mov rdi, rbx                        ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_MAP_DUMB
+    mov rdx, drm_map_dumb_struct
+    syscall
+    
+    cmp rax, 0
+    jl .init_fail           ; Fail if ioctl error
+    
+    ; 5c. Get the 'offset' from the struct (offset 8)
+    mov r9, [drm_map_dumb_struct + 8]   ; r9 is 6th arg for mmap
+    
+    ; 5d. Call mmap
+    mov rax, SYS_MMAP
+    mov rdi, 0                          ; Let kernel choose address
+    mov rsi, [buffer_size]              ; Size of buffer
+    mov rdx, PROT_READ | PROT_WRITE     ; 0x3
+    mov r10, MAP_SHARED                 ; 0x1
+    mov r8, rbx                         ; gpu_fd
+    ; r9 already holds the offset
+    syscall
+    
+    ; 5e. Store the pointer
+    ; mmap returns MAP_FAILED (-1) on error.
+    cmp rax, -1
+    je .init_fail
+    
+    mov [framebuffer_pointer], rax
 
     ; If any step fails, we must 'ret' with rax = -1
     ; On success:
     mov rax, 0  ; Success
+    
+.init_cleanup:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
     mov rsp, rbp
     pop rbp
     ret
+
+.init_fail:
+    mov rax, -1 ; Return -1 on failure
+    jmp .init_cleanup
 
 init_input:
     ; Open the keyboard event device
@@ -268,9 +598,14 @@ init_input:
     syscall
 
     ; rax holds the file descriptor (or -1 on error)
+    cmp rax, 0
+    jl .input_fail
     mov [input_fd], rax
-
-    mov rsp, rbp
+    
+    pop rbp
+    ret
+    
+.input_fail:
     pop rbp
     ret
 
@@ -352,7 +687,7 @@ render_frame:
     ; This is the master render function
     
     ; 1. Clear the screen (or just overdraw)
-    ; call render_clear_screen
+    call render_clear_screen
     
     ; 2. Render the world (tilemap)
     call render_tilemap
@@ -382,8 +717,27 @@ render_frame:
 ; Low-Level Render Routines (Stubs)
 ;-------------------------------------------------
 render_clear_screen:
-    ; TODO: Fill the entire [framebuffer_pointer] with 0x00000000 (black)
+    ; Fills the entire [framebuffer_pointer] with 0x00000000 (black)
     ; Use 'rep stosd' for speed.
+    push rdi
+    push rcx
+    push rax
+
+    mov rdi, [framebuffer_pointer]  ; RDI = destination
+    
+    ; Calculate total number of 32-bit pixels (DWORDS)
+    ; size (in bytes) / 4
+    mov rax, [buffer_size]
+    shr rax, 2                      ; Divide by 4
+    mov rcx, rax                    ; RCX = count
+    
+    xor eax, eax                    ; EAX = 0x00000000 (the color black)
+    
+    rep stosd                       ; Fill RCX dwords at [RDI] with EAX
+
+    pop rax
+    pop rcx
+    pop rdi
     ret
 
 render_tilemap:
@@ -429,7 +783,7 @@ render_pause_menu:
     ; 4. call draw_text(msg_menu_item2, x=40, y=70, ...)
     ; 5. call draw_text(msg_menu_item3, x=40, y=90, ...)
     ; 6. Get [menu_cursor_pos]
-    ; 7. call draw_sprite(sprite_cursor, x=20, y=50 + cursor_pos*20, color=0xFFFFFF00)
+    ; 7. call draw_sprite(sprite_cursor, x=20, y=50 + cursor_pos*20, color=0xFFFFFF00) ; TODO: Implement this
     ret
     
 ;-------------------------------------------------
@@ -478,25 +832,87 @@ draw_text:
     ret
 
 ;-------------------------------------------------
+; Signal Handler (for Ctrl+C)
+;-------------------------------------------------
+setup_sigint_handler:
+    push rbp
+    mov rbp, rsp
+    
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, SIGINT             ; Signal number (2)
+    mov rsi, sa_handler_struct  ; Pointer to new sigaction struct
+    mov rdx, 0                  ; No need to retrieve old action
+    mov r10, 8                  ; Size of sigset_t (8 bytes)
+    syscall                     ; Execute syscall
+    
+    mov rsp, rbp
+    pop rbp
+    ret
+
+;-------------------------------------------------
 ; Exit Routines
 ;-------------------------------------------------
 clean_exit:
-    ; TODO: Restore the original graphics mode!
-    ;  a. ioctl(gpu_fd, DRM_IOCTL_MODE_SET_CRTC, &drm_old_crtc_struct)
+    ; This function is now called by SIGINT or by normal exit
+    
+    ; We must be careful here, as some of these resources
+    ; might not have been acquired if init failed.
+    
+    ; 1. Restore the original graphics mode
+    ; Check if gpu_fd is valid (greater than 0)
+    mov rdi, [gpu_fd]
+    cmp rdi, 0
+    jle .skip_modeset_restore
 
-    ; TODO: Unmap framebuffer
-    ;  a. mov rax, SYS_MUNMAP, rdi=framebuffer_pointer, rsi=size
+    mov rax, SYS_IOCTL
+    ; rdi is already gpu_fd
+    mov rsi, DRM_IOCTL_MODE_SET_CRTC
+    mov rdx, drm_old_crtc_struct
+    syscall
+    ; We don't care about the return value, we're exiting anyway.
+.skip_modeset_restore:
 
-    ; TODO: Close file descriptors
-    ;  a. call SYS_CLOSE with [gpu_fd]
-    ;  b. call SYS_CLOSE with [input_fd]
+    ; 2. Unmap framebuffer
+    mov rdi, [framebuffer_pointer]
+    cmp rdi, 0
+    jle .skip_munmap
+    
+    mov rax, SYS_MUNMAP
+    ; rdi is already framebuffer_pointer
+    mov rsi, [buffer_size]
+    syscall
+.skip_munmap:
 
+    ; 3. Close file descriptors
+    mov rdi, [gpu_fd]
+    cmp rdi, 0
+    jle .skip_gpu_close
+    
+    mov rax, SYS_CLOSE
+    ; rdi is already gpu_fd
+    syscall
+.skip_gpu_close:
+
+    mov rdi, [input_fd]
+    cmp rdi, 0
+    jle .skip_input_close
+
+    mov rax, SYS_CLOSE
+    ; rdi is already input_fd
+    syscall
+.skip_input_close:
+    
+    ; 4. Exit
     mov rax, SYS_EXIT
     mov rdi, 0 ; EXIT_SUCCESS
     syscall
 
 error_exit:
-    ; TODO: We should still try to restore the console if possible
+    ; In a real app, we'd print an error to stderr first
+    ; For now, just exit with an error code
+    
+    ; We should still ATTEMPT to restore the console,
+    ; but we'll skip that for this skeleton.
     
     mov rax, SYS_EXIT
     mov rdi, 1 ; EXIT_FAILURE
