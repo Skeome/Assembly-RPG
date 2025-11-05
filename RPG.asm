@@ -189,6 +189,8 @@ section .bss
     connector_id_list resd 16
     crtc_id_list resd 16
     encoder_id_list resd 16
+    
+    conn_encoder_list resd 16       ; New buffer for connector-specific encoders
 
     ; We use a generous 256 bytes. The kernel fills this.
     ; This struct is 96 bytes, but we also ask the kernel
@@ -296,7 +298,7 @@ init_graphics:
     ; --- Phase 1: Open /dev/dri/card1 (SYS_OPEN) ---
     mov rax, SYS_OPEN
     mov rdi, dri_path
-    mov rsi, O_RDWR
+    mov rsi, O_RDWR | O_NONBLOCK
     syscall
     
     cmp rax, 0
@@ -306,7 +308,32 @@ init_graphics:
 
     ; --- Phase 2a: Get Hardware Resources (CRTCs, Connectors) ---
     
-    ; We need to set the pointers in the struct *before* the call
+    ; --- FIRST CALL: Get the counts ---
+    ; We set all pointers to NULL (0)
+    mov rax, 0
+    mov [drm_resources_struct + 16], rax ; connector_id_ptr = 0
+    mov [drm_resources_struct + 8], rax  ; crtc_id_ptr = 0
+    mov [drm_resources_struct + 24], rax ; encoder_id_ptr = 0
+    
+    ; Set the counts to zero, to *request* the counts
+    mov dword [drm_resources_struct + 32], 0  ; count_fbs
+    mov dword [drm_resources_struct + 36], 0 ; count_crtcs
+    mov dword [drm_resources_struct + 40], 0 ; count_connectors
+    mov dword [drm_resources_struct + 44], 0 ; count_encoders
+    
+    mov rax, SYS_IOCTL
+    mov rdi, rbx            ; rdi = gpu_fd
+    mov rsi, DRM_IOCTL_MODE_GETRESOURCES
+    mov rdx, drm_resources_struct
+    syscall
+    
+    cmp rax, 0
+    jl .init_fail           ; If ioctl failed, exit
+    
+    ; --- SECOND CALL: Get the lists ---
+    ; The kernel has now filled in the counts (e.g., at +40)
+    ; We now set our pointers and buffer sizes.
+    
     mov rax, connector_id_list
     mov [drm_resources_struct + 16], rax ; connector_id_ptr
     
@@ -317,6 +344,8 @@ init_graphics:
     mov [drm_resources_struct + 24], rax ; encoder_id_ptr
     
     ; Set the counts to the size of our lists (16)
+    ; Note: A robust program would check the counts from the first
+    ; call and not overrun 16, but we'll assume it fits.
     mov dword [drm_resources_struct + 32], 0  ; count_fbs (we don't need)
     mov dword [drm_resources_struct + 36], 16 ; count_crtcs
     mov dword [drm_resources_struct + 40], 16 ; count_connectors
@@ -351,22 +380,26 @@ init_graphics:
     
     ; 2. Call GETCONNECTOR to get its info
     
-    ; Set the connector_id field (offset 36)
-    mov [drm_connector_struct + 36], r15d
+    ; Set the connector_id field (offset 48)
+    mov [drm_connector_struct + 48], r15d
     
     ; Set the pointers for the kernel to write lists into
-    ; --- NEW OFFSETS ---
     ; We'll store the modes list right after the struct (at +96)
     lea rax, [drm_connector_struct + 96]
     mov [modes_list_ptr], rax
-    mov [drm_connector_struct + 8], rax  ; modes_ptr
+    mov [drm_connector_struct + 8], rax  ; modes_ptr (offset 8)
     
-    mov rax, encoder_id_list
-    mov [drm_connector_struct + 16], rax ; encoders_ptr
+    ; We don't care about properties, so set props_ptr to 0
+    mov qword [drm_connector_struct + 16], 0 ; props_ptr (offset 16)
+    
+    ; mov rax, encoder_id_list
+    mov rax, conn_encoder_list      ; Use the new buffer
+    mov [drm_connector_struct + 24], rax ; encoders_ptr (offset 24)
     
     ; Set counts for our buffers
-    mov dword [drm_connector_struct + 28], 16 ; count_modes
-    mov dword [drm_connector_struct + 32], 16 ; count_encoders
+    mov dword [drm_connector_struct + 32], 16 ; count_modes (offset 32)
+    mov dword [drm_connector_struct + 36], 0  ; count_props (offset 36)
+    mov dword [drm_connector_struct + 40], 16 ; count_encoders (offset 40)
     
     mov rax, SYS_IOCTL
     mov rdi, rbx                ; rdi = gpu_fd
@@ -377,13 +410,13 @@ init_graphics:
     cmp rax, 0
     jl .connector_loop          ; If ioctl failed, try next connector
     
-    ; 3. Check connection status (offset 40)
-    mov eax, [drm_connector_struct + 40]
+    ; 3. Check connection status (offset 52)
+    mov eax, [drm_connector_struct + 52]
     cmp eax, 1                  ; 1 = DRM_MODE_CONNECTED
     jne .connector_loop         ; If not 1, try next connector
 
-    ; 4. Check that it has at least one mode (offset 28)
-    mov eax, [drm_connector_struct + 28]
+    ; 4. Check that it has at least one mode (offset 32)
+    mov eax, [drm_connector_struct + 32]
     cmp eax, 0
     jle .connector_loop         ; If 0 modes, try next connector
 
@@ -401,9 +434,10 @@ init_graphics:
     
 .find_encoder:
     ; --- Phase 2e/2f: Find a compatible Encoder and CRTC ---
-    ; We now have a connector-specific list of encoders in encoder_id_list
-    mov r12d, [drm_connector_struct + 32] ; r12d = count_encoders
-    mov r13, encoder_id_list             ; r13 = encoder_id_list pointer
+    ; We now have a connector-specific list of encoders in conn_encoder_list
+    mov r12d, [drm_connector_struct + 40] ; r12d = count_encoders (offset 40)
+    ; mov r13, encoder_id_list             ; r13 = encoder_id_list pointer
+    mov r13, conn_encoder_list      ; Read from the new buffer
     xor r14, r14                         ; r14 = outer loop counter (i)
     
 .encoder_loop:
