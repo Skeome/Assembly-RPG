@@ -44,7 +44,7 @@ section .data
     MAP_SHARED equ 0x1
 
     ; --- DRM/KMS Device Path ---
-    dri_path db '/dev/dri/card1', 0 ; <-- FIX: Using card1 as per user's system
+    dri_path db '/dev/dri/card1', 0 ; Using card1 as per user's system
 
     ; --- Input Device Path ---
     ; NOTE: This is a placeholder! You will need to parse /proc/bus/input/devices
@@ -55,7 +55,7 @@ section .data
     ; _IOWR(DRM_COMMAND_BASE, 0xA0, struct drm_mode_card_res)
     DRM_IOCTL_MODE_GETRESOURCES equ 0xC04064A0
     ; _IOWR(DRM_COMMAND_BASE, 0xA7, struct drm_mode_get_connector)
-    ; --- FIX: Sizeof(struct) is 96 (0x60), not 64 (0x40) ---
+    ; Sizeof(struct) is 96 (0x60)
     DRM_IOCTL_MODE_GETCONNECTOR equ 0xC06064A7
     ; _IOWR(DRM_COMMAND_BASE, 0xB2, struct drm_mode_create_dumb)
     DRM_IOCTL_MODE_CREATE_DUMB equ 0xC02064B2
@@ -191,7 +191,13 @@ section .bss
     encoder_id_list resd 16
 
     ; We use a generous 256 bytes. The kernel fills this.
+    ; This struct is 96 bytes, but we also ask the kernel
+    ; to write the modes list right after it.
     drm_connector_struct resb 256
+    
+    ; Pointer for the modes list
+    modes_list_ptr resq 1
+    
     drm_encoder_struct resb 28     ; sizeof(struct drm_mode_get_encoder)
     drm_create_dumb_struct resb 32  ; sizeof(struct drm_mode_create_dumb)
     drm_map_dumb_struct resb 16     ; sizeof(struct drm_mode_map_dumb)
@@ -310,7 +316,7 @@ init_graphics:
     mov rax, encoder_id_list
     mov [drm_resources_struct + 24], rax ; encoder_id_ptr
     
-    ; --- FIX: Set the counts to the size of our lists (16) ---
+    ; Set the counts to the size of our lists (16)
     mov dword [drm_resources_struct + 32], 0  ; count_fbs (we don't need)
     mov dword [drm_resources_struct + 36], 16 ; count_crtcs
     mov dword [drm_resources_struct + 40], 16 ; count_connectors
@@ -334,20 +340,33 @@ init_graphics:
     jae .no_connector_found     ; If yes, fail (no monitor plugged in)
 
     ; 1. Get connector_id from the list
-    ; --- FIX: Kernel array is 32-bit (dword), so multiply by 4 ---
     mov r15d, [connector_id_list + r13*4] ; r15d = connector_id
     inc r13                             ; (i++)
     
-    ; --- FIX: Zero out the struct before use ---
+    ; Zero out the struct before use
     lea rdi, [drm_connector_struct]
     mov rcx, 256 / 8 ; 32 qwords
     xor rax, rax
     rep stosq
-    ; --- END FIX ---
     
     ; 2. Call GETCONNECTOR to get its info
-    ; Set the connector_id field (offset 8)
-    mov [drm_connector_struct + 8], r15d ; <-- FIX: Use r15d
+    
+    ; Set the connector_id field (offset 36)
+    mov [drm_connector_struct + 36], r15d
+    
+    ; Set the pointers for the kernel to write lists into
+    ; --- NEW OFFSETS ---
+    ; We'll store the modes list right after the struct (at +96)
+    lea rax, [drm_connector_struct + 96]
+    mov [modes_list_ptr], rax
+    mov [drm_connector_struct + 8], rax  ; modes_ptr
+    
+    mov rax, encoder_id_list
+    mov [drm_connector_struct + 16], rax ; encoders_ptr
+    
+    ; Set counts for our buffers
+    mov dword [drm_connector_struct + 28], 16 ; count_modes
+    mov dword [drm_connector_struct + 32], 16 ; count_encoders
     
     mov rax, SYS_IOCTL
     mov rdi, rbx                ; rdi = gpu_fd
@@ -358,38 +377,31 @@ init_graphics:
     cmp rax, 0
     jl .connector_loop          ; If ioctl failed, try next connector
     
-    ; 3. Check connection status (offset 16)
-    mov eax, [drm_connector_struct + 16]
+    ; 3. Check connection status (offset 40)
+    mov eax, [drm_connector_struct + 40]
     cmp eax, 1                  ; 1 = DRM_MODE_CONNECTED
     jne .connector_loop         ; If not 1, try next connector
 
-    ; 4. Check that it has at least one mode (offset 36)
-    mov eax, [drm_connector_struct + 36]
+    ; 4. Check that it has at least one mode (offset 28)
+    mov eax, [drm_connector_struct + 28]
     cmp eax, 0
     jle .connector_loop         ; If 0 modes, try next connector
 
     ; --- Success: We found a connected monitor! ---
-    ; 5. Save the connector_id
-    mov eax, [drm_connector_struct + 8]
-    mov [selected_connector_id], eax
+    ; 5. Save the connector_id (which we know is in r15d)
+    mov [selected_connector_id], r15d
     
-    ; 6. Save the first available mode (offset 40)
+    ; 6. Save the first available mode
+    ; The kernel wrote the list to [modes_list_ptr]
     ; struct drm_mode_modeinfo is 32 bytes
-    lea rsi, [drm_connector_struct + 40] ; rsi = pointer to first mode
+    mov rsi, [modes_list_ptr]            ; rsi = pointer to first mode
     lea rdi, [selected_mode]             ; rdi = destination
     mov rcx, 32                          ; 32 bytes
     rep movsb
     
-.connector_found: ; <-- Breakpoint 403
+.find_encoder:
     ; --- Phase 2e/2f: Find a compatible Encoder and CRTC ---
-    ; We have a list of encoders for our connector in [encoder_id_list]
-    ; We have a list of all CRTCs in [crtc_id_list]
-    ; We must find an encoder that has a bitmask entry for a valid CRTC.
-.no_connector_found:
-    ; This jump happens if r13 >= r12
-    cmp r13, r12
-    jge .init_fail ; If we checked all and found none, fail
-
+    ; We now have a connector-specific list of encoders in encoder_id_list
     mov r12d, [drm_connector_struct + 32] ; r12d = count_encoders
     mov r13, encoder_id_list             ; r13 = encoder_id_list pointer
     xor r14, r14                         ; r14 = outer loop counter (i)
@@ -399,17 +411,16 @@ init_graphics:
     jae .no_crtc_found          ; If yes, fail (no compatible encoder/crtc)
     
     ; 1. Get an encoder_id from our connector's list
-    ; --- FIX: Kernel array is 32-bit (dword), so multiply by 4 ---
     mov edi, [r13 + r14*4]
     inc r14                     ; (i++)
     
     ; 2. Call GETENCODER to get its info
-    ; --- FIX: Zero out the struct ---
-    lea rsi, [drm_encoder_struct]
+    ; Zero out the struct
+    lea rdi, [drm_encoder_struct]
     mov rcx, 28 / 4 ; 7 dwords
     xor rax, rax
     rep stosd
-    ; --- END FIX ---
+    
     mov dword [drm_encoder_struct + 4], edi ; Set encoder_id field (offset 4)
     
     mov rax, SYS_IOCTL
@@ -433,17 +444,16 @@ init_graphics:
     jae .encoder_loop           ; If yes, this encoder failed, try next one
     
     ; Check if bit 'j' is set in 'possible_crtcs'
-    mov rax, r10                ; Use rax for bit test
-    mov cl, r9b                 ; Move 8-bit loop counter 'j' into CL
-    shr rax, cl                 ; Shift rax right by the amount in CL
-    and rax, 1                  ; Isolate the bit
+    mov r11, r10                ; Use r11 for the bit test (r10d has the mask)
+    mov ecx, r9d                ; Use ecx for shift count (from r9)
+    shr r11, cl                 ; Shift r11 right by the amount in CL
+    and r11, 1                  ; Isolate the bit
     
-    cmp rax, 1
+    cmp r11, 1
     jne .next_crtc              ; Bit not set, this CRTC is not compatible
     
     ; --- Success: We found a match! ---
     ; The 'j'th CRTC in [crtc_id_list] is compatible.
-    ; --- FIX: Kernel array is 32-bit (dword), so multiply by 4 ---
     mov eax, [crtc_id_list + r9*4]
     mov [selected_crtc_id], eax ; Save the 32-bit ID
     
@@ -453,6 +463,7 @@ init_graphics:
     inc r9                      ; (j++)
     jmp .crtc_loop
 
+.no_connector_found:
 .no_crtc_found:
     ; We looped all encoders and found no compatible CRTC
     jmp .init_fail
