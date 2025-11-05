@@ -1,6 +1,6 @@
 ;-------------------------------------------------------
 ; Assembly Program: RPG                                 |
-; Target Platform: Linux x86_64                         |   
+; Target Platform: Linux x86_64                         |
 ; Description: A classic RPG game                       |
 ; Assembler: NASM                                       |
 ; Author: Skeome                                        |
@@ -44,24 +44,25 @@ section .data
     MAP_SHARED equ 0x1
 
     ; --- DRM/KMS Device Path ---
-    dri_path db '/dev/dri/card0', 0
+    dri_path db '/dev/dri/card1', 0 ; <-- FIX: Using card1 as per user's system
 
     ; --- Input Device Path ---
     ; NOTE: This is a placeholder! You will need to parse /proc/bus/input/devices
     ; or /dev/input/by-path/ to find the correct keyboard event file.
-    input_event_path db '/dev/input/event0', 0
+    input_event_path db '/dev/input/by-path/platform-i8042-serio-0-event-kbd', 0
 
     ; --- DRM IOCTL Magic Numbers (Correct for x86_64) ---
     ; _IOWR(DRM_COMMAND_BASE, 0xA0, struct drm_mode_card_res)
-    DRM_IOCTL_MODE_GETRESOURCES equ 0xC02064A0
+    DRM_IOCTL_MODE_GETRESOURCES equ 0xC04064A0
     ; _IOWR(DRM_COMMAND_BASE, 0xA7, struct drm_mode_get_connector)
-    DRM_IOCTL_MODE_GETCONNECTOR equ 0xC04064A7
+    ; --- FIX: Sizeof(struct) is 96 (0x60), not 64 (0x40) ---
+    DRM_IOCTL_MODE_GETCONNECTOR equ 0xC06064A7
     ; _IOWR(DRM_COMMAND_BASE, 0xB2, struct drm_mode_create_dumb)
     DRM_IOCTL_MODE_CREATE_DUMB equ 0xC02064B2
     ; _IOWR(DRM_COMMAND_BASE, 0xB3, struct drm_mode_map_dumb)
     DRM_IOCTL_MODE_MAP_DUMB equ 0xC01064B3
     ; _IOWR(DRM_COMMAND_BASE, 0xA2, struct drm_mode_crtc)
-    DRM_IOCTL_MODE_SET_CRTC equ 0xC06064A2
+    DRM_IOCTL_MODE_SET_CRTC equ 0xC05864A2
     ; _IOWR(DRM_COMMAND_BASE, 0xA1, struct drm_mode_crtc)
     DRM_IOCTL_MODE_GET_CRTC equ 0xC05864A1
     ; _IOWR(DRM_COMMAND_BASE, 0xA6, struct drm_mode_get_encoder)
@@ -135,7 +136,6 @@ section .data
     frame_delay_req:
         dq 0            ; tv_sec
         dq 16666667     ; tv_nsec
-    ; --- REMOVED 'frame_delay_rem' FROM .data ---
 
     ; --- SIGACTION Structure ---
     ; struct sigaction { void (*sa_handler)(int); unsigned long sa_flags; ... }
@@ -157,7 +157,7 @@ section .bss
     buffer_handle resd 1
     buffer_size resq 1          ; 64-bit total size of the buffer
     
-    ; --- ADDED 'frame_delay_rem' TO .bss ---
+    ; Placeholder for nanosleep
     frame_delay_rem:
         resb 16
     
@@ -169,28 +169,26 @@ section .bss
     res_connector_ptr resq 1
     res_crtc_ptr resq 1
     
-    ; struct drm_mode_card_res
-    ; 6 * 8-byte pointers (fb, crtc, conn, enc, ...)
-    ; 4 * 4-byte counts (count_fbs, count_crtcs, ...)
-    ; 4 * 4-byte mins/maxs (min_w, max_w, ...)
+    ; struct drm_mode_card_res (size 64 bytes)
     drm_resources_struct:
-        resq 1  ; fb_id_ptr
-        resq 1  ; crtc_id_ptr
-        resq 1  ; connector_id_ptr
-        resq 1  ; encoder_id_ptr
-        resd 1  ; count_fbs
-        resd 1  ; count_crtcs
-        resd 1  ; count_connectors
-        resd 1  ; count_encoders
-        resd 1  ; min_width
-        resd 1  ; max_width
-        resd 1  ; min_height
-        resd 1  ; max_height
+        resq 1  ; fb_id_ptr (offset 0)
+        resq 1  ; crtc_id_ptr (offset 8)
+        resq 1  ; connector_id_ptr (offset 16)
+        resq 1  ; encoder_id_ptr (offset 24)
+        resd 1  ; count_fbs (offset 32)
+        resd 1  ; count_crtcs (offset 36)
+        resd 1  ; count_connectors (offset 40)
+        resd 1  ; count_encoders (offset 44)
+        resd 1  ; min_width (offset 48)
+        resd 1  ; max_width (offset 52)
+        resd 1  ; min_height (offset 56)
+        resd 1  ; max_height (offset 60)
 
     ; Pointers to the lists themselves (we need 16 entries max for now)
-    connector_id_list resq 16
-    crtc_id_list resq 16
-    encoder_id_list resq 16
+    ; These are arrays of 32-bit IDs
+    connector_id_list resd 16
+    crtc_id_list resd 16
+    encoder_id_list resd 16
 
     ; We use a generous 256 bytes. The kernel fills this.
     drm_connector_struct resb 256
@@ -198,8 +196,8 @@ section .bss
     drm_create_dumb_struct resb 32  ; sizeof(struct drm_mode_create_dumb)
     drm_map_dumb_struct resb 16     ; sizeof(struct drm_mode_map_dumb)
     
-    ; struct drm_mode_crtc
-    drm_set_crtc_struct resb 88     ; sizeof(struct drm_mode_crtc)
+    ; struct drm_mode_crtc (size 88 bytes)
+    drm_set_crtc_struct resb 88
     drm_old_crtc_struct resb 88     ; To restore the console on exit
 
     ; --- DRM Results (to store what we find) ---
@@ -289,7 +287,7 @@ init_graphics:
     push r14
     push r15
     
-    ; --- Phase 1: Open /dev/dri/card0 (SYS_OPEN) ---
+    ; --- Phase 1: Open /dev/dri/card1 (SYS_OPEN) ---
     mov rax, SYS_OPEN
     mov rdi, dri_path
     mov rsi, O_RDWR
@@ -312,10 +310,11 @@ init_graphics:
     mov rax, encoder_id_list
     mov [drm_resources_struct + 24], rax ; encoder_id_ptr
     
-    ; Set the counts to the size of our lists (16)
-    mov dword [drm_resources_struct + 36], 16 ; count_connectors
-    mov dword [drm_resources_struct + 32], 16 ; count_crtcs
-    mov dword [drm_resources_struct + 40], 16 ; count_encoders
+    ; --- FIX: Set the counts to the size of our lists (16) ---
+    mov dword [drm_resources_struct + 32], 0  ; count_fbs (we don't need)
+    mov dword [drm_resources_struct + 36], 16 ; count_crtcs
+    mov dword [drm_resources_struct + 40], 16 ; count_connectors
+    mov dword [drm_resources_struct + 44], 16 ; count_encoders
     
     mov rax, SYS_IOCTL
     mov rdi, rbx            ; rdi = gpu_fd
@@ -327,7 +326,7 @@ init_graphics:
     jl .init_fail           ; If ioctl failed, exit
 
     ; --- Phase 2b/2c/2d: Find a "Connected" Monitor (Connector) ---
-    mov r12d, [drm_resources_struct + 36] ; r12d = number of connectors found
+    mov r12d, [drm_resources_struct + 40] ; r12d = number of connectors found
     xor r13, r13                          ; r13 = loop counter (i)
     
 .connector_loop:
@@ -335,12 +334,20 @@ init_graphics:
     jae .no_connector_found     ; If yes, fail (no monitor plugged in)
 
     ; 1. Get connector_id from the list
-    mov rdi, [connector_id_list + r13*8]
-    inc r13                     ; (i++)
+    ; --- FIX: Kernel array is 32-bit (dword), so multiply by 4 ---
+    mov r15d, [connector_id_list + r13*4] ; r15d = connector_id
+    inc r13                             ; (i++)
+    
+    ; --- FIX: Zero out the struct before use ---
+    lea rdi, [drm_connector_struct]
+    mov rcx, 256 / 8 ; 32 qwords
+    xor rax, rax
+    rep stosq
+    ; --- END FIX ---
     
     ; 2. Call GETCONNECTOR to get its info
     ; Set the connector_id field (offset 8)
-    mov [drm_connector_struct + 8], rdi
+    mov [drm_connector_struct + 8], r15d ; <-- FIX: Use r15d
     
     mov rax, SYS_IOCTL
     mov rdi, rbx                ; rdi = gpu_fd
@@ -362,7 +369,7 @@ init_graphics:
     jle .connector_loop         ; If 0 modes, try next connector
 
     ; --- Success: We found a connected monitor! ---
-    ; 5. Save the connector_id (offset 8)
+    ; 5. Save the connector_id
     mov eax, [drm_connector_struct + 8]
     mov [selected_connector_id], eax
     
@@ -373,11 +380,16 @@ init_graphics:
     mov rcx, 32                          ; 32 bytes
     rep movsb
     
+.connector_found: ; <-- Breakpoint 403
     ; --- Phase 2e/2f: Find a compatible Encoder and CRTC ---
     ; We have a list of encoders for our connector in [encoder_id_list]
     ; We have a list of all CRTCs in [crtc_id_list]
     ; We must find an encoder that has a bitmask entry for a valid CRTC.
-    
+.no_connector_found:
+    ; This jump happens if r13 >= r12
+    cmp r13, r12
+    jge .init_fail ; If we checked all and found none, fail
+
     mov r12d, [drm_connector_struct + 32] ; r12d = count_encoders
     mov r13, encoder_id_list             ; r13 = encoder_id_list pointer
     xor r14, r14                         ; r14 = outer loop counter (i)
@@ -387,10 +399,17 @@ init_graphics:
     jae .no_crtc_found          ; If yes, fail (no compatible encoder/crtc)
     
     ; 1. Get an encoder_id from our connector's list
-    mov rdi, [r13 + r14*8]
+    ; --- FIX: Kernel array is 32-bit (dword), so multiply by 4 ---
+    mov edi, [r13 + r14*4]
     inc r14                     ; (i++)
     
     ; 2. Call GETENCODER to get its info
+    ; --- FIX: Zero out the struct ---
+    lea rsi, [drm_encoder_struct]
+    mov rcx, 28 / 4 ; 7 dwords
+    xor rax, rax
+    rep stosd
+    ; --- END FIX ---
     mov dword [drm_encoder_struct + 4], edi ; Set encoder_id field (offset 4)
     
     mov rax, SYS_IOCTL
@@ -406,7 +425,7 @@ init_graphics:
     mov r10d, [drm_encoder_struct + 12] ; r10d = possible_crtcs (offset 12)
     
     ; 4. Check this bitmask against our list of CRTCs
-    mov r15d, [drm_resources_struct + 32] ; r15d = res_count_crtcs
+    mov r15d, [drm_resources_struct + 36] ; r15d = res_count_crtcs
     xor r9, r9                           ; r9 = inner loop counter (j)
     
 .crtc_loop:
@@ -424,10 +443,11 @@ init_graphics:
     
     ; --- Success: We found a match! ---
     ; The 'j'th CRTC in [crtc_id_list] is compatible.
-    mov eax, [crtc_id_list + r9*8]
+    ; --- FIX: Kernel array is 32-bit (dword), so multiply by 4 ---
+    mov eax, [crtc_id_list + r9*4]
     mov [selected_crtc_id], eax ; Save the 32-bit ID
     
-    jmp .connector_found        ; We are done with Phase 2
+    jmp .crtc_found        ; We are done with Phase 2
     
 .next_crtc:
     inc r9                      ; (j++)
@@ -437,10 +457,7 @@ init_graphics:
     ; We looped all encoders and found no compatible CRTC
     jmp .init_fail
 
-.no_connector_found:
-    jmp .init_fail          ; No connected monitor found
-
-.connector_found:
+.crtc_found:
     ; --- Phase 3: Create a "Dumb Buffer" ---
     
     ; 3a. Fill drm_create_dumb_struct
@@ -568,7 +585,7 @@ init_graphics:
     je .init_fail
     
     mov [framebuffer_pointer], rax
-
+    
     ; If any step fails, we must 'ret' with rax = -1
     ; On success:
     mov rax, 0  ; Success
@@ -806,11 +823,15 @@ draw_sprite:
     ; 2. Loop 8 times (for y=0 to 7)
     ; 3.   mov al, [RDI+y] ; Get 8-bit mask row
     ; 4.   Loop 8 times (for x=0 to 7)
-    ; 5.     shl al, 1
-    ; 6.     jnc .skip_pixel
-    ; 7.     mov [base_addr + x*4], ecx ; Write color
-    ; 8.   .skip_pixel:
-    ; 9.   base_addr += [buffer_pitch]
+    ; 5.     mov cl, 7
+    ; 6.     sub cl, bl ; bl is x (0-7)
+    ; 7.     shr al, cl ; Shift bit 'x' into lowest position
+    ; 8.     and al, 1  ; Isolate bit
+    ; 9.     cmp al, 0
+    ; 10.    je .skip_pixel
+    ; 11.    mov [base_addr + x*4], ecx ; Write color
+    ; 12.  .skip_pixel:
+    ; 13.  base_addr += [buffer_pitch]
     ret
     
 ; Args: RDI=x, RSI=y, RDX=w, RCX=h, R8=color
