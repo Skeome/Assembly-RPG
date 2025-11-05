@@ -1,0 +1,3 @@
+#Ignore object and executable files
+*.o
+RPG
